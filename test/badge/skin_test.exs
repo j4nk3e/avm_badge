@@ -4,6 +4,7 @@ defmodule Badge.SkinTest do
   alias Badge.Skin
   alias Badge.Skin.Dark
   alias Badge.Skin.Macintosh
+  alias Badge.Skin.Purple
   alias Badge.Skin.Win95
   alias Badge.Skin.WinXP
   alias Badge.Theme
@@ -40,7 +41,9 @@ defmodule Badge.SkinTest do
       assert Skin.shift(Dark, 1) == Win95
       assert Skin.shift(Win95, 1) == WinXP
       assert Skin.shift(WinXP, 1) == Macintosh
-      assert Skin.shift(Macintosh, 1) == Macintosh
+      assert Skin.shift(Macintosh, 1) == Purple
+      assert Skin.shift(Purple, 1) == Purple
+      assert Skin.shift(Purple, -1) == Macintosh
       assert Skin.shift(Macintosh, -1) == WinXP
     end
   end
