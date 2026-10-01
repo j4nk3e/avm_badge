@@ -36,6 +36,7 @@ defmodule Badge.Bluesky do
     "cid",
     "viewer",
     "like",
+    "following",
     "reason",
     "$type",
     "author",
@@ -232,6 +233,7 @@ defmodule Badge.Bluesky do
             cid: text(post, "cid"),
             root: root(Map.get(record, "reply")),
             liked: liked(Map.get(post, "viewer")),
+            following: following(Map.get(author, "viewer")),
             like_uri: liked(Map.get(post, "viewer")),
             who: Text.cp437(text(author, "displayName") || handle),
             handle: Text.cp437(handle),
@@ -251,6 +253,10 @@ defmodule Badge.Bluesky do
   # The owner's like of a post, as its record URI; only a logged-in answer says.
   defp liked(%{"like" => like}) when is_binary(like), do: like
   defp liked(_viewer), do: nil
+
+  # The owner's follow of the author, as its record URI; only a logged-in answer says.
+  defp following(%{"following" => follow}) when is_binary(follow), do: follow
+  defp following(_viewer), do: nil
 
   @doc "Whether the owner likes `post`, or is about to."
   @spec liked?(post) :: boolean

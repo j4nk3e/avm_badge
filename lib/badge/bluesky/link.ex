@@ -72,6 +72,22 @@ defmodule Badge.Bluesky.Link do
   @spec like(binary) :: :ok
   def like(uri), do: GenServer.cast(__MODULE__, {:like, uri})
 
+  @doc "Shows `handle`'s posts, keeping the feed aside for `unvisit/0`."
+  @spec visit(binary) :: :ok
+  def visit(handle), do: GenServer.cast(__MODULE__, {:visit, handle})
+
+  @doc "Shows the feed kept aside by `visit/1`, keeping the visit aside."
+  @spec unvisit() :: :ok
+  def unvisit, do: GenServer.cast(__MODULE__, :unvisit)
+
+  @doc "Shows the feed and forgets any visit."
+  @spec end_visit() :: :ok
+  def end_visit, do: GenServer.cast(__MODULE__, :end_visit)
+
+  @doc "Toggles following the account `handle`. See `status/0`'s `follows`."
+  @spec toggle_follow(binary) :: :ok
+  def toggle_follow(handle), do: GenServer.cast(__MODULE__, {:toggle_follow, handle})
+
   @doc "Fetches the page after the held posts, when there is one."
   @spec more() :: :ok
   def more, do: GenServer.cast(__MODULE__, :more)
@@ -116,11 +132,17 @@ defmodule Badge.Bluesky.Link do
 
   def handle_cast({:select, key}, state), do: {:noreply, State.select(state, key)}
   def handle_cast(:close, state), do: {:noreply, State.close(state)}
+  def handle_cast({:visit, handle}, state), do: {:noreply, State.visit(state, handle)}
+  def handle_cast(:unvisit, state), do: {:noreply, State.unvisit(state)}
+  def handle_cast(:end_visit, state), do: {:noreply, State.end_visit(state)}
   def handle_cast(:retry, state), do: {:noreply, State.retry(state)}
   def handle_cast(:reload, state), do: {:noreply, State.reload(state)}
   def handle_cast(:more, state), do: {:noreply, State.more(state)}
 
   def handle_cast({:resolve, handle}, state), do: {:noreply, State.resolve(state, handle)}
+
+  def handle_cast({:toggle_follow, handle}, state),
+    do: {:noreply, State.toggle_follow(state, handle, :erlang.system_time(:second))}
 
   def handle_cast({:like, uri}, state),
     do: {:noreply, State.like(state, uri, :erlang.system_time(:second))}
@@ -149,6 +171,7 @@ defmodule Badge.Bluesky.Link do
       {{:post, job}, state} -> {:noreply, start_post(state, job)}
       {{:like, job}, state} -> {:noreply, start_like(state, job)}
       {{:resolve, handle}, state} -> {:noreply, start_resolve(state, handle)}
+      {{:follow, job}, state} -> {:noreply, start_follow(state, job)}
       {:wait, state} -> {:noreply, state}
     end
   end
@@ -169,6 +192,12 @@ defmodule Badge.Bluesky.Link do
     report_like(job, result)
 
     {:noreply, State.liked(state, job, result)}
+  end
+
+  def handle_info({:followed, job, result}, state) do
+    report_follow(job, result)
+
+    {:noreply, State.followed(state, job, result)}
   end
 
   def handle_info({:posted, job, result}, state) do
@@ -254,6 +283,21 @@ defmodule Badge.Bluesky.Link do
 
     state
   end
+
+  defp start_follow(state, job) do
+    link = self()
+    base = state.base
+
+    spawn(fn -> send(link, {:followed, job, Account.follow(job, base)}) end)
+
+    state
+  end
+
+  defp report_follow(job, {:ok, _result}),
+    do: :io.format(~c"Bluesky: ~p done for ~s~n", [elem(job.action, 0), job.handle])
+
+  defp report_follow(job, {:error, reason}),
+    do: :io.format(~c"Bluesky: ~p of ~s failed ~p~n", [elem(job.action, 0), job.handle, reason])
 
   defp report_like(job, {:ok, _result}),
     do: :io.format(~c"Bluesky: ~p done for ~s~n", [elem(job.action, 0), job.uri])

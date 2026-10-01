@@ -69,6 +69,9 @@ defmodule Badge.Bluesky.Account do
   defp public(%{feed: {:thread, uri}}, base, columns),
     do: Bluesky.fetch_thread(base, uri, columns)
 
+  defp public(%{feed: {:author, actor}} = job, base, columns),
+    do: Bluesky.fetch(base, actor, columns, Map.get(job, :cursor))
+
   defp public(job, base, columns),
     do: Bluesky.fetch(base, job.actor, columns, Map.get(job, :cursor))
 
@@ -232,12 +235,11 @@ defmodule Badge.Bluesky.Account do
   """
   @spec create_post(session, binary, integer, map | nil, [map]) :: {:ok, binary} | {:error, term}
   def create_post(session, text, now, reply \\ nil, mentions \\ []) do
-    body =
-      json(%{
-        "repo" => session.did,
-        "collection" => "app.bsky.feed.post",
-        "record" => record(text, now, reply, mentions)
-      })
+    create_record(session, "app.bsky.feed.post", record(text, now, reply, mentions))
+  end
+
+  defp create_record(session, collection, record) do
+    body = json(%{"repo" => session.did, "collection" => collection, "record" => record})
 
     Http.post(
       session.pds,
@@ -298,21 +300,14 @@ defmodule Badge.Bluesky.Account do
       "createdAt" => timestamp(now)
     }
 
-    body =
-      json(%{"repo" => session.did, "collection" => "app.bsky.feed.like", "record" => record})
-
-    Http.post(
-      session.pds,
-      "/xrpc/com.atproto.repo.createRecord",
-      [Http.bearer(session.access)],
-      body,
-      &parse_created/1
-    )
+    create_record(session, "app.bsky.feed.like", record)
   end
 
-  defp like_action(session, {:unlike, like}, _now) do
-    body =
-      json(%{"repo" => session.did, "collection" => "app.bsky.feed.like", "rkey" => rkey(like)})
+  defp like_action(session, {:unlike, like}, _now),
+    do: delete_record(session, "app.bsky.feed.like", like)
+
+  defp delete_record(session, collection, uri) do
+    body = json(%{"repo" => session.did, "collection" => collection, "rkey" => rkey(uri)})
 
     Http.post(
       session.pds,
@@ -321,6 +316,35 @@ defmodule Badge.Bluesky.Account do
       body,
       fn _body -> {:ok, nil} end
     )
+  end
+
+  @doc """
+  Follows or unfollows an account, logging in if `job` holds no session.
+  `job.action` is `{:follow, handle}` or `{:unfollow, follow_uri}`; the
+  answer carries the new follow record's URI, or nil after an unfollow.
+  """
+  @spec follow(map, binary) :: {:ok, %{uri: binary | nil, session: session}} | {:error, term}
+  def follow(job, base) do
+    with {:ok, session} <- session(job, base),
+         {:ok, uri} <- follow_action(session, base, job.action, job.now) do
+      {:ok, %{uri: uri, session: session}}
+    end
+  end
+
+  defp follow_action(session, base, {:follow, handle}, now) do
+    case resolve(base, handle) do
+      {:ok, did} -> create_record(session, "app.bsky.graph.follow", follow_record(did, now))
+      error -> error
+    end
+  end
+
+  defp follow_action(session, _base, {:unfollow, follow}, _now),
+    do: delete_record(session, "app.bsky.graph.follow", follow)
+
+  @doc "The record that follows the account `did`, dated `now` in epoch seconds."
+  @spec follow_record(binary, integer) :: map
+  def follow_record(did, now) do
+    %{"$type" => "app.bsky.graph.follow", "subject" => did, "createdAt" => timestamp(now)}
   end
 
   @doc """

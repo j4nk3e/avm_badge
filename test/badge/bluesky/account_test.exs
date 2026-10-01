@@ -199,6 +199,14 @@ defmodule Badge.Bluesky.AccountTest do
     end
   end
 
+  test "follow_record/2 follows the account by its DID" do
+    assert Account.follow_record("did:plc:ada", 0) == %{
+             "$type" => "app.bsky.graph.follow",
+             "subject" => "did:plc:ada",
+             "createdAt" => "1970-01-01T00:00:00.000Z"
+           }
+  end
+
   test "key/1 is a feed's kind and URI" do
     assert Account.key(%{kind: :feed, uri: @hot, name: "Discover"}) == {:feed, @hot}
   end

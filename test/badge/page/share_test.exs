@@ -441,6 +441,32 @@ defmodule Badge.Page.ShareTest do
     end
   end
 
+  describe "enter on the share screen" do
+    test "opens the badge heard last, and escape goes back to beaming" do
+      {:ok, heard} =
+        Page.handle_ir(@other, Wire.encode(:name, [:name, :bluesky], "Pat"), loaded())
+
+      {:ok, heard} =
+        Page.handle_ir(@other, Wire.encode(:bluesky, [:name, :bluesky], "pat.bsky.social"), heard)
+
+      opened = press(heard, {:edit, :newline})
+
+      assert opened.mode == :detail
+      assert opened.opened.profile == %{name: "Pat", bluesky: "pat.bsky.social"}
+      assert says?(opened, "Bluesky   Esc back")
+      assert press(opened, {:nav, :clover}).visit == "pat.bsky.social"
+
+      back = press(opened, {:nav, :home})
+
+      assert back.mode == :show
+      assert back.screen == 0
+    end
+
+    test "does nothing before anyone has been heard" do
+      assert Page.handle_key({:edit, :newline}, loaded()) == :ignore
+    end
+  end
+
   describe "the detail" do
     defp opened(extra \\ %{}) do
       press(collected([peer(1, "Ada Lovelace", extra)]), {:edit, :newline})
@@ -486,6 +512,31 @@ defmodule Badge.Page.ShareTest do
       assert press(state, {:move, :right}).mode == :detail
       assert press(state, {:move, :right}).screen == 2
       refute Enum.any?(Page.render(state), &match?({:rect, _x, 228, 6, 6, _c}, &1))
+    end
+
+    test "the clover on someone with a Bluesky handle opens their posts" do
+      state = opened(%{bluesky: "@ada.bsky.social"})
+
+      assert says?(state, "Bluesky   Esc back")
+
+      assert [{:image, _x, 208, _bg, {:rgba8888, 32, 32, _data}}] =
+               for({:image, _x, 208, _bg, _img} = item <- Page.render(state), do: item)
+
+      assert press(state, {:edit, :newline}) == state
+
+      pressed = press(state, {:nav, :clover})
+
+      assert pressed.visit == "ada.bsky.social"
+      assert pressed.mode == :detail
+      assert Page.tick(%{pressed | stored: pressed.peers}) == {:goto, Badge.Page.Bluesky}
+      assert :erlang.erase(:bluesky_visit) == "ada.bsky.social"
+    end
+
+    test "the clover on someone without one stays put" do
+      state = opened(%{github: "ada"})
+
+      refute says?(state, "Bluesky")
+      assert press(state, {:nav, :clover}) == state
     end
   end
 end

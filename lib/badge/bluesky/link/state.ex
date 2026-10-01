@@ -43,6 +43,15 @@ defmodule Badge.Bluesky.Link.State do
 
   `reload/1` fetches the feed shown again from its first page.
 
+  `visit/2` shows another account's posts and keeps the feed shown aside;
+  `unvisit/1` swaps them back, keeping the visit aside in turn, so switching
+  between the two fetches nothing. `end_visit/1` goes back to the feed and
+  forgets the visit.
+
+  `toggle_follow/3` flips following an account as shown, and the server is
+  brought to it the way likes are; `followed/3` takes each answer. A fetched
+  page of an account's posts says whether the owner follows it.
+
   `more/1` asks for the page after the held posts, appended to them, up to
   50 in all. Once a feed has been paged it is not refreshed until it is
   opened or chosen again, so reading further down never jumps back to the top.
@@ -84,6 +93,11 @@ defmodule Badge.Bluesky.Link.State do
       dirty: [],
       like_at: 0,
       reload: false,
+      follows: %{},
+      following: nil,
+      follow_at: 0,
+      aside: nil,
+      visiting: false,
       handles: %{},
       to_resolve: [],
       resolving: nil,
@@ -114,9 +128,15 @@ defmodule Badge.Bluesky.Link.State do
       more: more?(state),
       append: state.append,
       post: posting(state.post),
+      follows: state.follows,
+      visiting: state.visiting,
+      aside: aside_key(state.aside),
       handles: state.handles
     }
   end
+
+  defp aside_key(nil), do: nil
+  defp aside_key(%{key: key}), do: key
 
   defp posting({:queued, _text, _now, _reply}), do: :posting
   defp posting(post), do: post
@@ -274,6 +294,10 @@ defmodule Badge.Bluesky.Link.State do
         back: nil,
         liking: nil,
         dirty: [],
+        follows: %{},
+        following: nil,
+        aside: nil,
+        visiting: false,
         handles: %{},
         to_resolve: [],
         resolving: nil,
@@ -320,21 +344,79 @@ defmodule Badge.Bluesky.Link.State do
   @spec close_thread(map) :: map
   def close_thread(%{back: nil} = state), do: state
 
-  def close_thread(%{back: back} = state) do
+  def close_thread(%{back: back} = state), do: bring(%{state | back: nil}, back)
+
+  # Puts a saved feed back as it was, paging and all.
+  defp bring(state, slot) do
     %{
       state
-      | feed: back.feed,
-        back: nil,
-        state: restored(state.state, back.posts),
-        posts: back.posts,
-        cursor: back.cursor,
+      | feed: slot.feed,
+        state: restored(state.state, slot.posts),
+        posts: slot.posts,
+        cursor: slot.cursor,
         append: false,
-        paged: back.paged,
+        paged: slot.paged,
         reason: nil,
         version: state.version + 1,
-        at: back.at,
+        at: slot.at,
         failures: 0
     }
+  end
+
+  # Another feed from its first page, the posts held now gone.
+  defp fresh(state, key) do
+    %{
+      state
+      | feed: key,
+        state: settled(state.state),
+        posts: {},
+        cursor: nil,
+        append: false,
+        paged: false,
+        back: nil,
+        reason: nil,
+        version: state.version + 1,
+        at: nil,
+        failures: 0
+    }
+  end
+
+  @doc """
+  Shows `handle`'s posts, keeping the feed shown aside, outside any thread.
+  Posts kept aside from an earlier visit to `handle` come back unfetched.
+  """
+  @spec visit(map, binary) :: map
+  def visit(state, handle) do
+    state = close_thread(state)
+
+    case shown(state) == {:author, handle} do
+      true -> %{state | visiting: true}
+      false -> %{swap(state, {:author, handle}) | visiting: true}
+    end
+  end
+
+  @doc "Shows the feed kept aside by `visit/2` again, keeping the visit aside. Outside a visit, nothing."
+  @spec unvisit(map) :: map
+  def unvisit(%{visiting: false} = state), do: state
+
+  def unvisit(state) do
+    state = close_thread(state)
+    key = aside_key(state.aside) || shown(%{state | feed: nil})
+
+    %{swap(state, key) | visiting: false}
+  end
+
+  @doc "Shows the feed again and forgets the visit."
+  @spec end_visit(map) :: map
+  def end_visit(state), do: %{unvisit(state) | aside: nil}
+
+  defp swap(state, key) do
+    held = Map.put(saved(state), :key, shown(state))
+
+    case state.aside do
+      %{key: ^key} = aside -> %{bring(state, aside) | aside: held}
+      _other -> %{fresh(state, key) | aside: held}
+    end
   end
 
   # A fetch under way still answers for the thread, and is dropped when it lands.
@@ -364,6 +446,113 @@ defmodule Badge.Bluesky.Link.State do
 
   def resolved(state, handle, {:error, _reason}),
     do: %{state | resolving: nil, handles: Map.put(state.handles, handle, :failed)}
+
+  @doc """
+  Toggles following `handle` as shown, at once, dated `now` in epoch
+  seconds. The link brings the server to what shows, one request at a time;
+  presses while one is out are kept. Without a password, nothing changes.
+  """
+  @spec toggle_follow(map, binary, integer) :: map
+  def toggle_follow(%{password: nil} = state, _handle, _now), do: state
+
+  def toggle_follow(state, handle, now) do
+    entry = Map.get(state.follows, handle, %{shown: false, server: nil, failed: nil})
+
+    %{
+      state
+      | follows: Map.put(state.follows, handle, %{entry | shown: not entry.shown, failed: nil}),
+        follow_at: now
+    }
+  end
+
+  # The first account whose shown follow differs from the server's, as a job.
+  defp next_follow(state) do
+    pending =
+      for {handle, %{shown: shown, server: server}} <- :maps.to_list(state.follows),
+          shown != (server != nil),
+          do: {handle, server}
+
+    case pending do
+      [] -> nil
+      [{handle, nil} | _rest] -> follow_job(state, handle, {:follow, handle})
+      [{handle, server} | _rest] -> follow_job(state, handle, {:unfollow, server})
+    end
+  end
+
+  defp follow_job(state, handle, action) do
+    %{
+      actor: state.actor,
+      password: state.password,
+      session: state.session,
+      pds: state.pds,
+      handle: handle,
+      action: action,
+      now: state.follow_at
+    }
+  end
+
+  @doc """
+  Takes what a follow process brought back for `job`. The server's follow is
+  kept; a failure shows it again, with the reason. One for another account
+  is dropped.
+  """
+  @spec followed(map, map, {:ok, map} | {:error, term}) :: map
+  def followed(
+        %{actor: actor, password: password} = state,
+        %{actor: actor, password: password} = job,
+        result
+      ),
+      do: apply_follow(%{state | following: nil}, job, result)
+
+  def followed(state, _job, _result), do: %{state | following: nil}
+
+  defp apply_follow(state, job, {:ok, %{uri: uri, session: session}}) do
+    put_follow(%{state | session: session}, job.handle, &%{&1 | server: uri})
+  end
+
+  defp apply_follow(state, job, {:error, reason}) do
+    state = %{state | session: session_after_error(reason, state.session)}
+
+    put_follow(state, job.handle, &%{&1 | shown: &1.server != nil, failed: reason})
+  end
+
+  defp put_follow(state, handle, change) do
+    case Map.get(state.follows, handle) do
+      nil -> state
+      entry -> %{state | follows: Map.put(state.follows, handle, change.(entry))}
+    end
+  end
+
+  # A fresh page of an author's posts says whether the owner follows them,
+  # unless a press is still on its way to the server.
+  defp learn_follow(%{password: nil} = state, _key, _posts), do: state
+
+  defp learn_follow(state, {:author, handle}, posts) do
+    case {Map.get(state.follows, handle), author_follow(posts, handle, 0)} do
+      {_entry, :unknown} ->
+        state
+
+      {%{shown: shown, server: server}, _follow} when shown != (server != nil) ->
+        state
+
+      {_entry, follow} ->
+        entry = %{shown: follow != nil, server: follow, failed: nil}
+        %{state | follows: Map.put(state.follows, handle, entry)}
+    end
+  end
+
+  defp learn_follow(state, _key, _posts), do: state
+
+  defp author_follow(posts, _handle, index) when index >= tuple_size(posts), do: :unknown
+
+  defp author_follow(posts, handle, index) do
+    post = Bluesky.unpack(posts, index)
+
+    case Map.get(post, :handle) == handle do
+      true -> Map.get(post, :following)
+      false -> author_follow(posts, handle, index + 1)
+    end
+  end
 
   @doc """
   Queues `text` to be posted, dated `now` in epoch seconds, as a reply when
@@ -422,20 +611,7 @@ defmodule Badge.Bluesky.Link.State do
         state
 
       false ->
-        %{
-          state
-          | feed: key,
-            state: settled(state.state),
-            posts: {},
-            cursor: nil,
-            append: false,
-            paged: false,
-            back: nil,
-            reason: nil,
-            version: state.version + 1,
-            at: nil,
-            failures: 0
-        }
+        fresh(state, key)
     end
   end
 
@@ -477,12 +653,18 @@ defmodule Badge.Bluesky.Link.State do
   do yet, or posts fresh enough on hand.
   """
   @spec load(map, boolean, integer) ::
-          {{:fetch, map} | {:post, map} | {:like, map} | {:resolve, binary} | :wait, map}
+          {{:fetch, map}
+           | {:post, map}
+           | {:like, map}
+           | {:resolve, binary}
+           | {:follow, map}
+           | :wait, map}
   def load(%{want: false} = state, _ready, _now), do: {:wait, state}
   def load(%{actor: nil} = state, _ready, _now), do: {:wait, state}
   def load(%{post: :posting} = state, _ready, _now), do: {:wait, state}
   def load(%{liking: liking} = state, _ready, _now) when liking != nil, do: {:wait, state}
   def load(%{resolving: handle} = state, _ready, _now) when handle != nil, do: {:wait, state}
+  def load(%{following: job} = state, _ready, _now) when job != nil, do: {:wait, state}
   def load(%{state: :loading} = state, _ready, _now), do: {:wait, state}
 
   def load(%{post: {:queued, _text, _at, _reply}} = state, true, _now),
@@ -491,26 +673,35 @@ defmodule Badge.Bluesky.Link.State do
   def load(%{to_resolve: [handle | rest]} = state, true, _now),
     do: {{:resolve, handle}, %{state | resolving: handle, to_resolve: rest}}
 
-  def load(%{dirty: [_ | _]} = state, true, now) do
-    case next_like(state) do
-      {:ok, job, state} -> {{:like, job}, %{state | liking: job}}
-      {:none, state} -> load(state, true, now)
+  def load(%{follows: follows} = state, true, now) when map_size(follows) > 0 do
+    case next_follow(state) do
+      nil -> load_rest(state, true, now)
+      job -> {{:follow, job}, %{state | following: job}}
     end
   end
 
-  def load(%{state: :failed} = state, ready, now) do
+  def load(state, ready, now), do: load_rest(state, ready, now)
+
+  defp load_rest(%{dirty: [_ | _]} = state, true, now) do
+    case next_like(state) do
+      {:ok, job, state} -> {{:like, job}, %{state | liking: job}}
+      {:none, state} -> load_rest(state, true, now)
+    end
+  end
+
+  defp load_rest(%{state: :failed} = state, ready, now) do
     case now - state.at < backoff(state.failures) do
       true -> {:wait, state}
       false -> attempt(state, ready)
     end
   end
 
-  def load(%{state: :ready, paged: true} = state, _ready, _now), do: {:wait, state}
+  defp load_rest(%{state: :ready, paged: true} = state, _ready, _now), do: {:wait, state}
 
-  def load(%{state: :ready, at: at} = state, _ready, now) when now - at < @stale,
+  defp load_rest(%{state: :ready, at: at} = state, _ready, now) when now - at < @stale,
     do: {:wait, state}
 
-  def load(state, ready, _now), do: attempt(state, ready)
+  defp load_rest(state, ready, _now), do: attempt(state, ready)
 
   # Not ready, and posts on hand beat a waiting screen while the radio settles.
   defp attempt(%{state: :ready} = state, false), do: {:wait, state}
@@ -563,6 +754,7 @@ defmodule Badge.Bluesky.Link.State do
 
   defp apply_result(state, cursor, {:ok, result}, now) do
     {posts, next} = paged(cursor, state.posts, result.posts, Map.get(result, :cursor))
+    state = learn_follow(state, shown(state), result.posts)
 
     %{
       state

@@ -275,7 +275,7 @@ Setup, flashing and the ESP-IDF workflow are in `README.md`.
   first page and puts the cursor at the top, showing `Refreshing...` in the
   corner until the link's version moves or the fetch fails; asked during a
   fetch, it follows once that lands
-- `l` toggles the owner's like of the post at the top. A post keeps what
+- The square shape key toggles the owner's like of the post at the top. A post keeps what
   shows (`liked`) apart from what the server holds (`like_uri`); a press
   flips only what shows, and the link sends `createRecord`/`deleteRecord`
   one at a time until the two agree. **Never drop a press while a request

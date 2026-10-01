@@ -89,6 +89,9 @@ defmodule Badge.Sim.Fakes do
               more: false,
               append: false,
               post: Map.get(d, :post, :none),
+              follows: Map.get(d, :follows, %{}),
+              visiting: Map.get(d, :visiting, false),
+              aside: Map.get(d, :aside),
               handles: Map.get(d, :handles, %{})
             }
 
@@ -105,6 +108,32 @@ defmodule Badge.Sim.Fakes do
 
           {:like, _uri}, d ->
             d
+
+          {:toggle_follow, handle}, d ->
+            follows = Map.get(d, :follows, %{})
+            shown = not Map.get(Map.get(follows, handle, %{}), :shown, false)
+            uri = if shown, do: "at://did:plc:sim/app.bsky.graph.follow/sim"
+            entry = %{shown: shown, server: uri, failed: nil}
+            Map.put(d, :follows, Map.put(follows, handle, entry))
+
+          {:visit, handle}, d ->
+            Map.merge(d, %{
+              feed: {:author, handle},
+              aside: Map.get(d, :feed),
+              visiting: true,
+              version: Map.get(d, :version, 1) + 1
+            })
+
+          :unvisit, %{visiting: true} = d ->
+            Map.merge(d, %{
+              feed: d.aside,
+              aside: d.feed,
+              visiting: false,
+              version: Map.get(d, :version, 1) + 1
+            })
+
+          :end_visit, %{visiting: true} = d ->
+            Map.merge(d, %{feed: d.aside, aside: nil, visiting: false})
 
           :reload, d ->
             Map.put(d, :version, Map.get(d, :version, 1) + 1)

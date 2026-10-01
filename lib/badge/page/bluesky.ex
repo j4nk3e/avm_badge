@@ -13,7 +13,7 @@ defmodule Badge.Page.Bluesky do
   wrote it and how long ago, the text, and the counts under it; Up and Down
   move the post at the top, and Down on the last post fetches the next page.
   `r` fetches the feed or thread again and goes back to its top, showing
-  Refreshing... in the corner until the fresh posts are in. `l` likes
+  Refreshing... in the corner until the fresh posts are in. The square key likes
   the post at the top, or takes the like back; a liked post shows a
   `<3` in the skin's alert colour before its counts.
 
@@ -25,6 +25,16 @@ defmodule Badge.Page.Bluesky do
   line, Tab to post, Tab again to confirm. Left or Esc goes back to the feed
   and keeps the draft; a reply that lands goes back to its thread. It is sent through the link, which refreshes the feed. Esc is left for the router and goes Home. Text
   only: images and cards are not drawn.
+
+  `visit/1`, called just before handing the screen here, opens the page on
+  another account's posts in a tab of their own, `@handle`, between the feed
+  and Post. The feed stays held beside it, so Left and Right switch between
+  the two without fetching either again, each at its own post. With no handle
+  of the owner's own, the visit is the only feed, read in public. Logged in,
+  the triangle key on another account's posts follows it, or unfollows it
+  again: the tab shows a check mark before the handle while it is followed,
+  and the corner says Following... or Unfollowing... until the server agrees,
+  or Follow failed.
 
   Posts and feeds live in `Badge.Bluesky.Link`, which fetches them while
   this page shows and answers from what it holds. The state holds them as
@@ -72,6 +82,11 @@ defmodule Badge.Page.Bluesky do
   @more_failed "Could not load more: "
   @no_feeds "No saved feeds"
   @refreshing "Refreshing..."
+  @following "Following..."
+  @unfollowing "Unfollowing..."
+  @follow_failed "Follow failed"
+  # CP437's check mark.
+  @followed_mark <<0xFB>>
   @logged_out "Not logged in"
   @log_in "Set an app password under"
   @log_in_where "Settings > Bluesky"
@@ -104,6 +119,12 @@ defmodule Badge.Page.Bluesky do
   @repost "repost: "
 
   @heart "<3"
+
+  @visit_key :bluesky_visit
+  @default_domain ".bsky.social"
+
+  # The two tabs that list posts: the feed, and a visited account.
+  defguardp listing(tab) when tab == :posts or tab == :visit
 
   @impl true
   def title, do: "Bluesky"
@@ -138,14 +159,43 @@ defmodule Badge.Page.Bluesky do
       asked: [],
       refreshing: nil,
       reply_to: nil,
+      visit: nil,
+      listing: :posts,
+      aside_cursor: 0,
       now: nil
     }
   end
 
+  @doc """
+  Opens the page on `handle`'s posts the next time it is entered. Call it
+  from another page's `tick/1`, which runs in `Badge.UI` as this page does.
+  """
+  @spec visit(binary) :: :ok
+  def visit(handle) do
+    :erlang.put(@visit_key, handle)
+
+    :ok
+  end
+
+  defp take_visit do
+    case :erlang.erase(@visit_key) do
+      :undefined -> nil
+      handle -> handle
+    end
+  end
+
   # The profile is read on the first tick, so init/0 stays pure.
   @impl true
-  def tick(%{loaded: false} = state),
-    do: tick(apply_login(Nvs.get(:bsky_pass), apply_profile(Profile.load(), state)))
+  def tick(%{loaded: false} = state) do
+    state =
+      apply_visit(
+        take_visit(),
+        apply_login(Nvs.get(:bsky_pass), apply_profile(Profile.load(), state))
+      )
+
+    start(state)
+    tick(state)
+  end
 
   def tick(%{actor: nil} = state), do: state
 
@@ -160,6 +210,21 @@ defmodule Badge.Page.Bluesky do
       false -> apply_posts(Link.posts(), status.version, apply_feeds(Link.feeds(), state))
     end
   end
+
+  defp start(%{actor: nil}), do: :ok
+
+  defp start(state) do
+    Link.open(state.actor, state.password)
+
+    case visit_tab?(state) do
+      true -> Link.visit(state.visit)
+      false -> Link.end_visit()
+    end
+  end
+
+  # A visit has a tab of its own beside the owner's feed.
+  defp visit_tab?(%{visit: nil}), do: false
+  defp visit_tab?(%{visit: visit, actor: actor}), do: visit != actor
 
   defp now do
     seconds = :erlang.system_time(:second)
@@ -182,6 +247,19 @@ defmodule Badge.Page.Bluesky do
 
   defp password(""), do: nil
   defp password(password), do: password
+
+  @doc """
+  Shows `handle`'s posts, or nothing new when it is nil. Without an account
+  of the owner's own, the page reads them in public. Called after
+  `apply_login/2`.
+  """
+  @spec apply_visit(binary | nil, map) :: map
+  def apply_visit(nil, state), do: state
+
+  def apply_visit(handle, %{actor: nil} = state),
+    do: %{state | actor: handle, password: nil, visit: handle}
+
+  def apply_visit(handle, state), do: %{state | visit: handle, tab: :visit, listing: :visit}
 
   @doc "Takes one reading of the link and of the clock. Called instead of `tick/1`."
   @spec apply_status(map, map, integer | nil) :: map
@@ -227,7 +305,7 @@ defmodule Badge.Page.Bluesky do
   def apply_refreshed(state), do: state
 
   defp landed(%{reply_to: nil} = state), do: %{state | stage: :sent}
-  defp landed(state), do: %{state | stage: :editing, tab: :posts, reply_to: nil}
+  defp landed(state), do: %{state | stage: :editing, tab: state.listing, reply_to: nil}
 
   @doc "Takes fresh posts from the link, tagged with their version."
   @spec apply_posts(Bluesky.posts(), integer, map) :: map
@@ -244,14 +322,16 @@ defmodule Badge.Page.Bluesky do
   def current(%{tab: :feeds, pick: pick}), do: pick
   def current(%{cursor: cursor}), do: cursor
 
-  @doc "The tab shown, `:posts` or `:feeds`."
-  @spec tab(map) :: :posts | :feeds
+  @doc "The tab shown: `:feeds`, `:posts`, `:visit` or `:compose`."
+  @spec tab(map) :: :feeds | :posts | :visit | :compose
   def tab(%{tab: tab}), do: tab
 
   @doc "The key of the feed whose posts are shown."
   @spec shown(map) :: Account.key() | nil
   def shown(%{status: %{feed: feed}}) when feed != nil, do: feed
   def shown(%{actor: nil}), do: nil
+  def shown(%{visit: visit, listing: :visit}) when visit != nil, do: {:author, visit}
+  def shown(%{visit: visit, actor: visit}), do: {:author, visit}
   def shown(%{password: nil, actor: actor}), do: {:author, actor}
   def shown(_state), do: {:timeline, nil}
 
@@ -272,10 +352,26 @@ defmodule Badge.Page.Bluesky do
     end
   end
 
+  def handle_key(event, %{tab: :visit} = state)
+      when event == {:nav, :home} or event == {:move, :left} do
+    case {thread?(state), event} do
+      {true, _event} -> {:ok, close_thread(state)}
+      {false, {:move, :left}} -> {:ok, switch(state, :posts)}
+      {false, _esc} -> :ignore
+    end
+  end
+
   def handle_key({:move, :right}, %{tab: :feeds} = state), do: {:ok, %{state | tab: :posts}}
 
-  def handle_key({:move, :right}, %{tab: :posts} = state),
-    do: {:ok, %{state | tab: :compose, reply_to: reply_target(state)}}
+  # Out of a thread, Right goes to the visit; in one, to the reply.
+  def handle_key({:move, :right}, %{tab: :posts} = state) do
+    case visit_tab?(state) and not thread?(state) do
+      true -> {:ok, switch(state, :visit)}
+      false -> {:ok, compose(state)}
+    end
+  end
+
+  def handle_key({:move, :right}, %{tab: :visit} = state), do: {:ok, compose(state)}
 
   def handle_key(event, %{tab: :compose} = state), do: compose_key(event, state)
 
@@ -297,25 +393,100 @@ defmodule Badge.Page.Bluesky do
     {:ok, %{state | status: Map.merge(status, %{state: :loading, append: true})}}
   end
 
-  def handle_key({:char, char}, %{tab: :posts} = state) when char == ?r or char == ?R do
+  def handle_key({:char, char}, %{tab: tab} = state)
+      when listing(tab) and (char == ?r or char == ?R) do
     Link.reload()
 
     {:ok, %{state | cursor: 0, refreshing: version(state)}}
   end
 
-  def handle_key({:char, char}, %{tab: :posts, posts: posts, password: password} = state)
-      when (char == ?l or char == ?L) and posts != {} and password != nil do
+  # The red square likes.
+  def handle_key({:nav, :square}, %{tab: tab, posts: posts, password: password} = state)
+      when listing(tab) and posts != {} and password != nil do
     Link.like(Map.get(Bluesky.unpack(posts, state.cursor), :uri))
 
     {:ok, state}
   end
 
-  def handle_key({:edit, :newline}, %{tab: :posts, posts: posts} = state) when posts != {},
-    do: open_thread(state, Map.get(Bluesky.unpack(posts, state.cursor), :uri))
+  # The orange triangle follows, and unfollows.
+  def handle_key({:nav, :triangle}, %{tab: tab, password: password} = state)
+      when listing(tab) and password != nil do
+    case followable(state) do
+      nil -> :ignore
+      handle -> {:ok, toggle_follow(state, handle)}
+    end
+  end
+
+  def handle_key({:edit, :newline}, %{tab: tab, posts: posts} = state)
+      when listing(tab) and posts != {},
+      do: open_thread(state, Map.get(Bluesky.unpack(posts, state.cursor), :uri))
 
   def handle_key({:edit, :newline}, %{status: %{state: :failed}} = state), do: retry(state)
 
   def handle_key(_event, _state), do: :ignore
+
+  defp compose(state), do: %{state | tab: :compose, reply_to: reply_target(state)}
+
+  # The link swaps the two feeds; each tab keeps the post it was at.
+  defp switch(state, tab) do
+    case tab do
+      :visit -> Link.visit(state.visit)
+      :posts -> Link.unvisit()
+    end
+
+    key = if tab == :visit, do: {:author, state.visit}, else: main_key(state)
+
+    %{
+      state
+      | tab: tab,
+        listing: tab,
+        posts: {},
+        cursor: state.aside_cursor,
+        aside_cursor: state.cursor,
+        status: Map.merge(state.status || %{}, %{feed: key, aside: shown(state)})
+    }
+  end
+
+  # The owner's feed: shown on its tab, else kept aside while the visit shows.
+  defp main_key(%{listing: :posts} = state), do: shown(state)
+
+  defp main_key(state) do
+    case Map.get(state.status || %{}, :aside) do
+      nil -> own_feed(state)
+      key -> key
+    end
+  end
+
+  defp own_feed(%{password: nil, actor: actor}), do: {:author, actor}
+  defp own_feed(_state), do: {:timeline, nil}
+
+  # Someone else's posts.
+  defp followable(state) do
+    case shown(state) do
+      {:author, author} when author != state.actor -> author
+      _other -> nil
+    end
+  end
+
+  # Flipped here at once; the link's next status says the same.
+  defp toggle_follow(state, handle) do
+    Link.toggle_follow(handle)
+
+    entry = follow_of(state, handle) || %{shown: false, server: nil, failed: nil}
+    follows = Map.put(follows(state), handle, %{entry | shown: not entry.shown, failed: nil})
+
+    %{state | status: Map.put(state.status || %{}, :follows, follows)}
+  end
+
+  defp follows(state), do: Map.get(state.status || %{}, :follows, %{})
+  defp follow_of(state, handle), do: Map.get(follows(state), handle)
+
+  defp followed?(state, handle) do
+    case follow_of(state, handle) do
+      %{shown: true} -> true
+      _other -> false
+    end
+  end
 
   # Inside a thread, what is written answers the post at the top.
   defp reply_target(%{posts: posts} = state) when posts != {} do
@@ -394,12 +565,12 @@ defmodule Badge.Page.Bluesky do
   defp feeds_key(_event, _state), do: :ignore
 
   # Leaving keeps the draft; Esc only steps back out of a confirm first.
-  defp compose_key({:move, :left}, state), do: {:ok, %{state | tab: :posts}}
+  defp compose_key({:move, :left}, state), do: {:ok, %{state | tab: state.listing}}
 
   defp compose_key({:nav, :home}, %{stage: :confirm} = state),
     do: {:ok, %{state | stage: :editing}}
 
-  defp compose_key({:nav, :home}, state), do: {:ok, %{state | tab: :posts}}
+  defp compose_key({:nav, :home}, state), do: {:ok, %{state | tab: state.listing}}
   defp compose_key(_event, %{password: nil}), do: :ignore
   defp compose_key(_event, %{stage: :sending} = state), do: {:ok, state}
 
@@ -447,14 +618,14 @@ defmodule Badge.Page.Bluesky do
   end
 
   # The feed already shown just turns back to it; another is asked for and waited on.
-  defp choose(state, _key, true), do: %{state | tab: :posts}
+  defp choose(state, _key, true), do: %{state | tab: :posts, listing: :posts}
 
   defp choose(state, key, false) do
     Link.select(key)
 
     status = Map.merge(state.status || %{}, %{state: :loading, reason: nil, feed: key})
 
-    %{state | tab: :posts, posts: {}, cursor: 0, status: status}
+    %{state | tab: :posts, listing: :posts, posts: {}, cursor: 0, status: status}
   end
 
   defp retry(state) do
@@ -494,26 +665,55 @@ defmodule Badge.Page.Bluesky do
   # Feeds, the name of the feed shown, then Post; the active tab lit, and where it stands.
   defp head(state) do
     place = place(state)
-    tab = compose_tab(state)
-    room = @columns - byte_size(@feeds_tab) - 2 - byte_size(tab) - 2 - byte_size(place) - 1
-    name = clip(feed_name(state), room)
-    second = @margin + (byte_size(@feeds_tab) + 2) * @char_w
-    third = second + (byte_size(name) + 2) * @char_w
+    compose = compose_tab(state)
+    room = @columns - byte_size(@feeds_tab) - 2 - byte_size(compose) - 2 - byte_size(place) - 1
+    tabs = [{:feeds, @feeds_tab}] ++ listing_tabs(state, room) ++ [{:compose, compose}]
 
-    [
-      {:text, @margin, @head_y, :default16px, tab_colour(state.tab, :feeds), Theme.bg(),
-       @feeds_tab},
-      {:text, second, @head_y, :default16px, tab_colour(state.tab, :posts), Theme.bg(), name},
-      {:text, third, @head_y, :default16px, tab_colour(state.tab, :compose), Theme.bg(), tab},
-      {:text, Readout.right_x(place), @head_y, :default16px, Theme.muted(), Theme.bg(), place}
-    ]
+    tab_items(tabs, state.tab, @margin, []) ++
+      [{:text, Readout.right_x(place), @head_y, :default16px, Theme.muted(), Theme.bg(), place}]
+  end
+
+  # The feed's name, and the visit's beside it, sharing what room there is.
+  defp listing_tabs(state, room) do
+    main = main_name(state)
+
+    case visit_tab?(state) do
+      false ->
+        [{:posts, clip(main, room)}]
+
+      true ->
+        visit = clip(visit_name(state), max(div(room - 2, 2), room - 2 - byte_size(main)))
+
+        [{:posts, clip(main, room - 2 - byte_size(visit))}, {:visit, visit}]
+    end
+  end
+
+  defp main_name(%{listing: :visit} = state), do: key_name(state, main_key(state))
+  defp main_name(state), do: feed_name(state)
+
+  defp visit_name(%{listing: :visit} = state), do: feed_name(state)
+  defp visit_name(state), do: tab_handle(state, state.visit)
+
+  defp tab_items([], _active, _x, acc), do: :lists.reverse(acc)
+
+  defp tab_items([{tab, name} | rest], active, x, acc) do
+    item = {:text, x, @head_y, :default16px, tab_colour(active, tab), Theme.bg(), name}
+
+    tab_items(rest, active, x + (byte_size(name) + 2) * @char_w, [item | acc])
   end
 
   defp version(%{status: %{version: version}}), do: version
   defp version(state), do: state.version
 
   # Refreshing shows in the corner; else the draft's length on Post, or where the top entry is.
-  defp place(%{tab: :posts, refreshing: since}) when since != nil, do: @refreshing
+  defp place(%{tab: tab, refreshing: since}) when listing(tab) and since != nil, do: @refreshing
+
+  defp place(%{tab: tab} = state) when listing(tab) do
+    case shown(state) do
+      {:author, author} -> follow_place(follow_of(state, author), state)
+      _key -> listed(state)
+    end
+  end
 
   defp place(%{tab: :compose, password: nil}), do: ""
 
@@ -522,7 +722,14 @@ defmodule Badge.Page.Bluesky do
       :erlang.integer_to_binary(Draft.count(draft)) <>
         "/" <> :erlang.integer_to_binary(Draft.limit())
 
-  defp place(state), do: place(list(state), current(state)) <> plus(state)
+  defp place(state), do: listed(state)
+
+  defp listed(state), do: place(list(state), current(state)) <> plus(state)
+
+  defp follow_place(%{shown: true, server: nil}, _state), do: @following
+  defp follow_place(%{shown: false, server: server}, _state) when server != nil, do: @unfollowing
+  defp follow_place(%{failed: failed}, _state) when failed != nil, do: @follow_failed
+  defp follow_place(_entry, state), do: listed(state)
 
   defp tab_colour(tab, tab), do: Theme.select()
   defp tab_colour(_tab, _active), do: Theme.dim()
@@ -531,7 +738,9 @@ defmodule Badge.Page.Bluesky do
   defp list(%{posts: posts}), do: posts
 
   # Another page to fetch, on the posts tab.
-  defp plus(%{tab: :posts, posts: posts, status: %{more: true}}) when posts != {}, do: "+"
+  defp plus(%{tab: tab, posts: posts, status: %{more: true}}) when listing(tab) and posts != {},
+    do: "+"
+
   defp plus(_state), do: ""
 
   defp place({}, _cursor), do: ""
@@ -540,7 +749,29 @@ defmodule Badge.Page.Bluesky do
     :erlang.integer_to_binary(cursor + 1) <> "/" <> :erlang.integer_to_binary(tuple_size(entries))
   end
 
-  defp feed_name(state), do: name_of(shown(state), state.feeds, 0)
+  # Someone else's posts, or a visit, go by their handle.
+  defp feed_name(state), do: key_name(state, shown(state))
+
+  defp key_name(state, {:author, author}) when author != state.actor or author == state.visit,
+    do: tab_handle(state, author)
+
+  defp key_name(state, key), do: name_of(key, state.feeds, 0)
+
+  # A tab is narrow; the default domain says nothing.
+  defp tab_handle(state, handle) do
+    size = byte_size(handle) - byte_size(@default_domain)
+
+    short =
+      case size > 0 and :binary.part(handle, size, byte_size(@default_domain)) == @default_domain do
+        true -> :binary.part(handle, 0, size)
+        false -> handle
+      end
+
+    case followed?(state, handle) do
+      true -> @followed_mark <> "@" <> short
+      false -> "@" <> short
+    end
+  end
 
   defp name_of({:author, _actor}, _feeds, _index), do: @own_tab
   defp name_of({:thread, _uri}, _feeds, _index), do: @thread_tab
@@ -681,9 +912,9 @@ defmodule Badge.Page.Bluesky do
   defp notice(state, _empty),
     do: [centred(@notice_y, Theme.muted(), clip(@fetching <> fetching(state), @columns))]
 
-  defp fetching(%{actor: actor} = state) do
+  defp fetching(state) do
     case shown(state) do
-      {:author, _actor} -> "@" <> actor
+      {:author, author} -> "@" <> author
       {:thread, _uri} -> "thread"
       _key -> feed_name(state)
     end

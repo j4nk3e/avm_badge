@@ -99,6 +99,170 @@ defmodule Badge.Page.BlueskyTest do
     end
   end
 
+  describe "visiting another account" do
+    @ada "ada.bsky.social"
+
+    # Logged in, on the visit tab, the link showing it with Following aside.
+    defp on_visit(posts \\ [post(%{})]) do
+      state = Page.apply_visit(@ada, Page.apply_login("pass", named()))
+      status = status(%{feed: {:author, @ada}, aside: {:timeline, nil}, count: length(posts)})
+
+      Page.apply_posts(Bluesky.pack(posts), 1, Page.apply_status(status, state, @now))
+    end
+
+    test "shows their posts in a tab of their own, beside the owner's feed" do
+      state = Page.apply_visit(@ada, named())
+      items = Page.render(Page.apply_status(status(%{state: :loading}), state, nil))
+
+      assert Page.tab(state) == :visit
+      assert Page.shown(state) == {:author, @ada}
+      assert row(items, @head_y) == ["Feeds", "Posts", "@ada", "Post", ""]
+
+      assert coloured(items, @head_y) |> List.keyfind("@ada", 0) ==
+               {"@ada", Theme.select()}
+
+      assert row(items, @notice_y) == ["Fetching @" <> @ada]
+    end
+
+    test "logged in, the feed beside it is the one kept aside" do
+      assert row(Page.render(on_visit()), @head_y) == [
+               "Feeds",
+               "Following",
+               "@ada",
+               "Post",
+               "1/1"
+             ]
+    end
+
+    test "Left goes to the feed and Right back, each tab at its own post" do
+      state = %{on_visit([post(%{}), post(%{})]) | cursor: 1}
+      feed = press(state, {:move, :left})
+
+      assert Page.tab(feed) == :posts
+      assert Page.shown(feed) == {:timeline, nil}
+      assert feed.cursor == 0
+
+      assert row(Page.render(feed), @head_y) |> Enum.take(3) == [
+               "Feeds",
+               "Following",
+               "@ada"
+             ]
+
+      back = press(feed, {:move, :right})
+
+      assert Page.tab(back) == :visit
+      assert Page.shown(back) == {:author, @ada}
+      assert back.cursor == 1
+    end
+
+    test "Right from the visit composes, and Left comes back to it" do
+      compose = press(on_visit(), {:move, :right})
+
+      assert Page.tab(compose) == :compose
+      assert Page.tab(press(compose, {:move, :left})) == :visit
+      assert Page.tab(press(compose, {:nav, :home})) == :visit
+    end
+
+    test "Esc on the visit is the router's, and the feed's Left still reaches Feeds" do
+      assert Page.handle_key({:nav, :home}, on_visit()) == :ignore
+
+      feed = press(on_visit(), {:move, :left})
+
+      assert Page.tab(press(feed, {:move, :left})) == :feeds
+    end
+
+    test "a handle outside bsky.social keeps its domain" do
+      state = Page.apply_visit("j4nk.dev", named())
+      items = Page.render(Page.apply_status(status(%{state: :loading}), state, nil))
+
+      assert row(items, @head_y) == ["Feeds", "Posts", "@j4nk.dev", "Post", ""]
+    end
+
+    test "the visit's tab keeps the header inside the panel" do
+      state = Page.apply_visit("a-very-long-handle-for-testing.bsky.social", named())
+      items = Page.render(Page.apply_status(status(%{state: :loading}), state, nil))
+
+      for {:text, x, @head_y, _font, _fg, _bg, body} <- items, body != "" do
+        assert x + byte_size(body) * 8 <= Theme.width()
+      end
+    end
+
+    test "the feed the link names wins once it has one" do
+      state = Page.apply_visit("ada.bsky.social", named())
+      status = status(%{feed: {:timeline, nil}})
+
+      assert Page.shown(Page.apply_status(status, state, nil)) == {:timeline, nil}
+    end
+
+    test "without a handle of the owner's own, reads them in public" do
+      state = Page.apply_visit("ada.bsky.social", Page.apply_login("pass", named("")))
+
+      assert state.actor == "ada.bsky.social"
+      assert state.password == nil
+      assert Page.shown(state) == {:author, "ada.bsky.social"}
+      assert Page.tab(state) == :posts
+      assert row(Page.render(state), @head_y) == ["Feeds", "@ada", "Post", ""]
+    end
+
+    test "the link still on their posts after the visit names them too" do
+      status = status(%{feed: {:author, "ada.bsky.social"}})
+      items = Page.render(Page.apply_status(status, named(), nil))
+
+      assert row(items, @head_y) == ["Feeds", "@ada", "Post", ""]
+    end
+
+    defp visiting(follow \\ nil) do
+      follows = if follow, do: %{@ada => follow}, else: %{}
+      status = status(%{feed: {:author, @ada}, follows: follows})
+      Page.apply_status(status, Page.apply_login("pass", named()), nil)
+    end
+
+    defp corner(state), do: List.last(row(Page.render(state), @head_y))
+
+    test "the triangle follows them at once, and the tab marks it" do
+      state = press(visiting(), {:nav, :triangle})
+
+      assert state.status.follows[@ada] == %{shown: true, server: nil, failed: nil}
+      assert corner(state) == "Following..."
+      assert "\xFB@ada" in row(Page.render(state), @head_y)
+
+      landed = visiting(%{shown: true, server: "at://f", failed: nil})
+
+      assert "\xFB@ada" in row(Page.render(landed), @head_y)
+      refute corner(landed) =~ "Follow"
+    end
+
+    test "the triangle again unfollows them" do
+      state = press(visiting(%{shown: true, server: "at://f", failed: nil}), {:nav, :triangle})
+
+      assert state.status.follows[@ada].shown == false
+      assert corner(state) == "Unfollowing..."
+      assert "@ada" in row(Page.render(state), @head_y)
+    end
+
+    test "a failure says so until the next press" do
+      failed = visiting(%{shown: false, server: nil, failed: :closed})
+
+      assert corner(failed) == "Follow failed"
+      assert corner(press(failed, {:nav, :triangle})) == "Following..."
+    end
+
+    test "the triangle is ignored on the owner's own posts, or logged out" do
+      own =
+        Page.apply_status(status(%{feed: {:author, @actor}}), Page.apply_login("p", named()), nil)
+
+      assert Page.handle_key({:nav, :triangle}, own) == :ignore
+
+      public = Page.apply_status(status(%{feed: {:author, @ada}}), named(), nil)
+
+      assert Page.handle_key({:nav, :triangle}, public) == :ignore
+    end
+
+    test "no visit changes nothing" do
+      assert Page.apply_visit(nil, named()) == named()
+    end
+  end
+
   describe "before the posts arrive" do
     test "shows the tabs and says whose posts it is fetching" do
       items = Page.render(Page.apply_status(status(%{state: :loading}), named(), nil))
@@ -832,11 +996,12 @@ defmodule Badge.Page.BlueskyTest do
              ]
     end
 
-    test "l toggles the like when logged in, and is left alone otherwise" do
+    test "the square toggles the like when logged in, and is left alone otherwise" do
       state = Page.apply_login("pw", shown([post(%{uri: "at://a"})]))
 
-      assert {:ok, ^state} = Page.handle_key({:char, ?l}, state)
-      assert Page.handle_key({:char, ?l}, shown([post(%{uri: "at://a"})])) == :ignore
+      assert {:ok, ^state} = Page.handle_key({:nav, :square}, state)
+      assert Page.handle_key({:nav, :square}, shown([post(%{uri: "at://a"})])) == :ignore
+      assert Page.handle_key({:char, ?l}, state) == :ignore
     end
   end
 

@@ -5,11 +5,14 @@ defmodule Badge.Page.Share do
   The share screen beams the owner's profile, one field per frame, while it
   is showing, and records the badges it hears. The sharing screen picks
   which fields go out; the collected screen lists who has been heard, and
-  Enter on a row shows what they shared.
+  Enter on a row shows what they shared. Enter on the share screen shows the
+  badge heard last the same way; Esc goes back to beaming. The clover key there, on someone
+  who shared a Bluesky handle, opens `Badge.Page.Bluesky` on their posts.
   """
 
   use Badge.Page
 
+  alias Badge.Bluesky
   alias Badge.Font
   alias Badge.Icons
   alias Badge.Identity
@@ -83,6 +86,12 @@ defmodule Badge.Page.Share do
   @art :badge_share
   @art_y 90
 
+  # The clover is drawn whole, centred on the hint line; its glyph starts 4 px in.
+  @bluesky_hint "Bluesky   Esc back"
+  @clover_inset 4
+  @clover_lift 8
+  @clover_w 28
+
   @dot_y 228
   @dot 6
   @dot_gap 10
@@ -121,6 +130,7 @@ defmodule Badge.Page.Share do
       cursor: 0,
       top: 0,
       opened: nil,
+      visit: nil,
       id: nil,
       chip: "",
       loaded: false
@@ -129,7 +139,15 @@ defmodule Badge.Page.Share do
 
   # Hardware is only touched here, never from a key handler.
   @impl true
-  def tick(state), do: state |> load() |> beam() |> settle() |> persist()
+  def tick(state), do: state |> load() |> beam() |> settle() |> persist() |> visit()
+
+  defp visit(%{visit: nil} = state), do: state
+
+  defp visit(state) do
+    Badge.Page.Bluesky.visit(state.visit)
+
+    {:goto, Badge.Page.Bluesky}
+  end
 
   # Everything stored arrives on the first tick, so init/0 stays pure.
   defp load(%{loaded: true} = state), do: state
@@ -200,6 +218,7 @@ defmodule Badge.Page.Share do
 
   def leave(state) do
     if state.shared != state.saved_shared, do: Sharing.save(state.shared)
+
     if state.peers != state.stored, do: Peers.save(state.peers)
 
     :ok
@@ -262,6 +281,14 @@ defmodule Badge.Page.Share do
   def handle_key({:move, :right}, %{mode: :show} = state), do: {:ok, turn(state, 1)}
   def handle_key({:move, :left}, %{mode: :show} = state), do: {:ok, turn(state, -1)}
 
+  # Enter on the share screen opens the badge heard last.
+  def handle_key({:edit, :newline}, %{mode: :show, screen: @share_screen} = state) do
+    case met_peer(state) do
+      nil -> :ignore
+      peer -> {:ok, %{state | mode: :detail, opened: peer}}
+    end
+  end
+
   def handle_key(event, %{mode: :show, screen: @sharing_screen} = state),
     do: sharing_key(event, state)
 
@@ -270,12 +297,24 @@ defmodule Badge.Page.Share do
 
   def handle_key(_event, _state), do: :ignore
 
+  defp met_peer(%{announced: {from, _name}, peers: peers}), do: Peers.find(peers, from)
+  defp met_peer(_state), do: nil
+
   defp turn(state, delta) do
     %{state | screen: rem(state.screen + delta + @screens, @screens), cursor: 0, top: 0}
   end
 
   # Escape closes the detail; it is trapped here and nowhere else on the page.
   defp detail_key({:nav, :home}, state), do: {:ok, %{state | mode: :show, opened: nil}}
+
+  # The jump itself waits for tick/1.
+  defp detail_key({:nav, :clover}, %{opened: %{profile: profile}} = state) do
+    case handle(profile) do
+      nil -> {:ok, state}
+      handle -> {:ok, %{state | visit: handle}}
+    end
+  end
+
   defp detail_key(_event, state), do: {:ok, state}
 
   defp sharing_key({:move, :up}, state),
@@ -487,8 +526,23 @@ defmodule Badge.Page.Share do
     name_items(lines, @name_y, []) ++
       [{:rect, @margin, rule_y, @rule_w, @rule_h, Theme.accent()}] ++
       detail_items(Profile.lines(profile), rule_y + 14, []) ++
-      [centred("Esc back", @hint_y, Theme.dim())]
+      detail_hint(handle(profile))
   end
+
+  defp detail_hint(nil), do: [centred("Esc back", @hint_y, Theme.dim())]
+
+  # The clover itself, beside what it does.
+  defp detail_hint(_handle) do
+    text = @bluesky_hint
+    left = div(Theme.width() - @clover_w - @char_w * byte_size(text), 2)
+
+    [
+      Icons.item(:clover, left - @clover_inset, @hint_y - @clover_lift),
+      {:text, left + @clover_w, @hint_y, :default16px, Theme.dim(), Theme.bg(), text}
+    ]
+  end
+
+  defp handle(profile), do: Bluesky.actor(Map.get(profile, :bluesky))
 
   defp name_items([], _y, acc), do: acc
 

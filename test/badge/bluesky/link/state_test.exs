@@ -1,6 +1,7 @@
 defmodule Badge.Bluesky.Link.StateTest do
   use ExUnit.Case, async: true
 
+  alias Badge.Bluesky
   alias Badge.Bluesky.Link.State
 
   @base "https://public.api.bsky.app"
@@ -725,6 +726,178 @@ defmodule Badge.Bluesky.Link.StateTest do
 
     test "retry leaves anything but a failure alone" do
       assert State.retry(wanted()) == wanted()
+    end
+  end
+
+  describe "toggle_follow/3 and followed/3" do
+    @ada_handle "ada.bsky.social"
+
+    defp fetched_author(following) do
+      posts = Bluesky.pack([%{uri: "at://p", handle: @ada_handle, following: following}])
+
+      {{:fetch, job}, loading} =
+        State.load(State.select(logged_in(0), {:author, @ada_handle}), true, 1)
+
+      State.fetched(loading, job, {:ok, %{posts: posts, feeds: nil, session: @session}}, 1)
+    end
+
+    defp follow_of(state), do: Map.get(State.status(state).follows, @ada_handle)
+
+    test "an author's posts say whether the owner follows them" do
+      assert follow_of(fetched_author("at://f1")) == %{
+               shown: true,
+               server: "at://f1",
+               failed: nil
+             }
+
+      assert follow_of(fetched_author(nil)) == %{shown: false, server: nil, failed: nil}
+    end
+
+    test "a press follows at once, goes out, and keeps the server's follow" do
+      state = State.toggle_follow(fetched_author(nil), @ada_handle, 100)
+
+      assert follow_of(state).shown
+
+      {{:follow, job}, sending} = State.load(state, true, 1)
+
+      assert job.action == {:follow, @ada_handle}
+      assert job.session == @session
+      assert job.now == 100
+      assert {:wait, _state} = State.load(sending, true, 1)
+
+      done = State.followed(sending, job, {:ok, %{uri: "at://f2", session: @session}})
+
+      assert follow_of(done) == %{shown: true, server: "at://f2", failed: nil}
+      refute match?({{:follow, _job}, _state}, State.load(done, true, 1))
+    end
+
+    test "a press on someone followed unfollows them" do
+      {{:follow, job}, sending} =
+        State.load(State.toggle_follow(fetched_author("at://f1"), @ada_handle, 100), true, 1)
+
+      assert job.action == {:unfollow, "at://f1"}
+
+      done = State.followed(sending, job, {:ok, %{uri: nil, session: @session}})
+
+      assert follow_of(done) == %{shown: false, server: nil, failed: nil}
+    end
+
+    test "presses while a request is out are kept, and the server follows the last" do
+      {{:follow, job}, sending} =
+        State.load(State.toggle_follow(fetched_author(nil), @ada_handle, 100), true, 1)
+
+      pressed = State.toggle_follow(sending, @ada_handle, 101)
+
+      refute follow_of(pressed).shown
+
+      landed = State.followed(pressed, job, {:ok, %{uri: "at://f2", session: @session}})
+
+      assert {{:follow, %{action: {:unfollow, "at://f2"}}}, _state} = State.load(landed, true, 1)
+    end
+
+    test "pressing twice before anything goes out sends nothing" do
+      state =
+        fetched_author(nil)
+        |> State.toggle_follow(@ada_handle, 100)
+        |> State.toggle_follow(@ada_handle, 101)
+
+      refute match?({{:follow, _job}, _state}, State.load(state, true, 1))
+    end
+
+    test "a failure shows what the server holds again, with the reason" do
+      {{:follow, job}, sending} =
+        State.load(State.toggle_follow(fetched_author(nil), @ada_handle, 100), true, 1)
+
+      failed = State.followed(sending, job, {:error, {:http, 401, ""}})
+
+      assert follow_of(failed) == %{shown: false, server: nil, failed: {:http, 401, ""}}
+      assert failed.session == nil
+    end
+
+    test "a refetch does not undo a press still on its way" do
+      state = State.toggle_follow(fetched_author(nil), @ada_handle, 100)
+      {{:follow, _job}, sending} = State.load(state, true, 1)
+      refreshed = State.reload(sending)
+
+      assert follow_of(refreshed).shown
+    end
+
+    test "logged out, or for another account, nothing changes" do
+      assert State.toggle_follow(ready(0), @ada_handle, 100) == ready(0)
+
+      state = State.toggle_follow(fetched_author(nil), @ada_handle, 100)
+
+      assert State.status(State.open(state, "other.bsky.social", @password)).follows == %{}
+    end
+  end
+
+  describe "visits" do
+    @ada {:author, "ada.bsky.social"}
+    @ada_posts Bluesky.pack([%{uri: "at://p", handle: "ada.bsky.social", following: nil}])
+
+    defp holding_feed, do: %{logged_in(0) | cursor: "c1", paged: true}
+
+    defp visited do
+      {{:fetch, job}, loading} =
+        State.load(State.visit(holding_feed(), "ada.bsky.social"), true, 1)
+
+      State.fetched(loading, job, {:ok, %{posts: @ada_posts, feeds: nil, session: @session}}, 1)
+    end
+
+    test "a visit fetches the account's posts and keeps the feed aside" do
+      state = State.visit(holding_feed(), "ada.bsky.social")
+
+      assert State.shown(state) == @ada
+      assert state.posts == {}
+      assert State.status(state).visiting
+      assert State.status(state).aside == {:timeline, nil}
+      assert {{:fetch, %{feed: @ada}}, _state} = State.load(state, true, 1)
+    end
+
+    test "going back brings the feed back as it was, and the visit is kept aside" do
+      back = State.unvisit(visited())
+
+      assert State.shown(back) == {:timeline, nil}
+      assert back.posts == @posts
+      assert back.cursor == "c1"
+      assert back.paged
+      assert back.state == :ready
+      refute State.status(back).visiting
+      assert State.status(back).aside == @ada
+
+      again = State.visit(back, "ada.bsky.social")
+
+      assert again.posts == @ada_posts
+      assert again.state == :ready
+      assert State.status(again).aside == {:timeline, nil}
+    end
+
+    test "visiting someone else drops the old visit and fetches them" do
+      state = State.visit(State.unvisit(visited()), "bob.bsky.social")
+
+      assert State.shown(state) == {:author, "bob.bsky.social"}
+      assert state.posts == {}
+      assert State.status(state).aside == {:timeline, nil}
+    end
+
+    test "a thread inside the visit closes before going back" do
+      back = State.unvisit(State.open_thread(visited(), "at://p"))
+
+      assert State.shown(back) == {:timeline, nil}
+      assert back.back == nil
+    end
+
+    test "ending the visit shows the feed and forgets it" do
+      done = State.end_visit(visited())
+
+      assert State.shown(done) == {:timeline, nil}
+      assert done.posts == @posts
+      assert State.status(done).aside == nil
+      assert State.end_visit(holding_feed()) == %{holding_feed() | aside: nil}
+    end
+
+    test "outside a visit, going back does nothing" do
+      assert State.unvisit(holding_feed()) == holding_feed()
     end
   end
 end
